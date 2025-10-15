@@ -1,76 +1,62 @@
 """
 This module provides a user-friendly Python interface to the core C++ MemoryManager.
+It is responsible for explicitly finding and loading the compiled C++ extension module.
 """
 import os
-import shutil
+import sys
+import importlib.util
 
-# --- Module Loading ---
-# This logic handles finding and importing the compiled C++ extension module.
-try:
-    # First, try a direct import. This works if the module is already in the path
-    # or has been installed properly.
-    from cobra_core import DeviceType, MemoryManager as _CppMemoryManager
-except ImportError:
-    # If the direct import fails, it likely means we are running from the source
-    # directory without a proper installation. We'll try to find the compiled
-    # .pyd file in the build directory and copy it locally.
-    
-    # Define the new name for our local module copy
-    _module_local_name = 'cobra_core.pyd'
-    
-    # Path to the build directory
-    _build_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'build', 'Debug')
+# --- Explicit Module Loading ---
 
-    _found_module_path = None
-    if os.path.exists(_build_dir):
-        for f in os.listdir(_build_dir):
-            if f.startswith('cobra_core') and f.endswith('.pyd'):
-                _found_module_path = os.path.join(_build_dir, f)
-                break
+# Determine the name of the compiled module file.
+# On Windows it's .pyd, on Linux/macOS it's .so
+MODULE_EXTENSION = '.pyd' if sys.platform == 'win32' else '.so'
 
-    if _found_module_path:
-        # Copy the found module to the root of the cobra package directory
-        _destination_path = os.path.join(os.path.dirname(__file__), '..', _module_local_name)
-        shutil.copy(_found_module_path, _destination_path)
-        
-        # Now, perform the import again. This should succeed.
-        from cobra_core import DeviceType, MemoryManager as _CppMemoryManager
-    else:
-        raise ImportError(
-            "Cobra C++ core module not found. "
-            "Please build the project first by running 'cmake --build .' in the 'build' directory."
-        )
+# Construct the absolute path to the project's root directory.
+# __file__ is the path to this file (manager.py)
+# os.path.dirname() gets the directory of the file (c:\Cobra\cobra\runtime)
+# We go up two levels to get to the root (c:\Cobra)
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+# Construct the absolute path to the build directory.
+_build_dir = os.path.join(_project_root, 'build', 'Debug')
+
+# Search for the compiled module file within the build directory.
+_module_path = None
+if os.path.exists(_build_dir):
+    for f in os.listdir(_build_dir):
+        if f.startswith('cobra_core') and f.endswith(MODULE_EXTENSION):
+            _module_path = os.path.join(_build_dir, f)
+            break
+
+# If the module file was not found, raise a clear error.
+if not _module_path:
+    raise ImportError(
+        f"Cobra C++ core module not found in '{_build_dir}'. "
+        "Please build the project first by running 'cmake --build .' in the 'build' directory."
+    )
+
+# Use the importlib library to load the module directly from its file path.
+# This is the most robust method and avoids all sys.path ambiguity.
+spec = importlib.util.spec_from_file_location('cobra_core', _module_path)
+_cobra_core = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(_cobra_core)
+
 
 # --- Public API ---
 
-# Re-export the DeviceType enum so users can access it as 'cobra.runtime.DeviceType'
-DeviceType = DeviceType
+# Now that we have loaded the module into the _cobra_core variable,
+# we can safely access its contents.
+DeviceType = _cobra_core.DeviceType
 
-# Get the single, global instance of the C++ MemoryManager.
-# We keep it as a "private" variable within this module.
-_manager_instance = _CppMemoryManager.get_instance()
+_manager_instance = _cobra_core.MemoryManager.get_instance()
 
-# Define our public Python functions that users will call.
-# These functions simply delegate to the underlying C++ instance.
 
 def allocate(size: int, device: DeviceType):
-    """
-    Allocates a block of memory on the specified device.
-
-    Args:
-        size (int): The number of bytes to allocate.
-        device (DeviceType): The device (CPU or GPU) to allocate on.
-
-    Returns:
-        A handle to the allocated memory.
-    """
+    """Allocates memory via the C++ backend."""
     return _manager_instance.allocate(size, device)
 
-def free(ptr):
-    """
-    Frees a previously allocated block of memory.
 
-    Args:
-        ptr: The memory handle to free.
-    """
+def free(ptr):
+    """Frees memory via the C++ backend."""
     _manager_instance.free(ptr)

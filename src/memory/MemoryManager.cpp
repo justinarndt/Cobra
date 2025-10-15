@@ -1,10 +1,10 @@
 #include "MemoryManager.h"
-#include <iostream> // For console output (std::cout)
+#include <iostream>
 
 namespace cobra {
 
     MemoryManager& MemoryManager::getInstance() {
-        static MemoryManager instance; // The one and only instance
+        static MemoryManager instance;
         return instance;
     }
 
@@ -13,16 +13,26 @@ namespace cobra {
         std::cout << "[MemoryManager] INFO: Requesting allocation of " << size
                   << " bytes on device: " << deviceName << std::endl;
 
-        // In a real implementation, we would call malloc, cudaMalloc, etc.
-        // For now, we return a null pointer as a placeholder.
-        return nullptr;
+        // --- CHANGE ---
+        // Instead of returning nullptr, we now allocate a single dummy byte
+        // on the C++ heap. This gives us a REAL, non-null pointer to use
+        // as a placeholder handle. We will use the size of the requested
+        // allocation to make the handle unique for this test.
+        char* dummy_handle = new char[size];
+        std::cout << "[MemoryManager] DEBUG: Created dummy handle at address "
+                  << static_cast<void*>(dummy_handle) << std::endl;
+        return dummy_handle;
     }
 
     void MemoryManager::free(void* ptr) {
         std::cout << "[MemoryManager] INFO: Requesting to free memory at address "
                   << ptr << std::endl;
 
-        // In a real implementation, we would call free, cudaFree, etc.
+        // --- CHANGE ---
+        // Now that we are allocating real C++ memory, we must free it to
+        // prevent memory leaks. The 'delete[]' operator matches the 'new char[]'
+        // in the allocate function.
+        delete[] static_cast<char*>(ptr);
     }
 
 } // namespace cobra
