@@ -75,10 +75,49 @@ class CobraIrGenerator(ast.NodeVisitor):
         self.ir.append(Instruction('RETURN', value_source))
 
 
+class CobraIrInterpreter:
+    """
+    Executes a list of Cobra IR instructions.
+    """
+    def __init__(self, cobra_ir, arg_names, arg_values):
+        self.ir = cobra_ir
+        self.memory = {}
+
+        # Load the function's arguments into memory.
+        for name, value in zip(arg_names, arg_values):
+            self.memory[name] = value
+
+    def run(self):
+        """Executes the IR instructions sequentially."""
+        print("[COBRA IR] --- Interpreter Start ---")
+        for instruction in self.ir:
+            opcode, arg = instruction.opcode, instruction.arg
+            print(f"[COBRA IR] Executing: {opcode} {arg}")
+
+            if opcode == 'ADD':
+                target, left_src, right_src = arg
+                left_val = self.memory[left_src]
+                right_val = self.memory[right_src]
+                self.memory[target] = left_val + right_val
+            
+            elif opcode == 'STORE':
+                target, source = arg
+                self.memory[target] = self.memory[source]
+
+            elif opcode == 'RETURN':
+                return_val = self.memory[arg]
+                print("[COBRA IR] --- Interpreter End ---")
+                return return_val
+        
+        # In case there is no return statement.
+        print("[COBRA IR] --- Interpreter End (No Return) ---")
+        return None
+
+
 def jit(func):
     """
     A decorator that intercepts a function call, translates it to
-    Cobra IR, and then executes the original function.
+    Cobra IR, and then executes it using an interpreter.
     """
     print(f"[COBRA JIT] Compiling function: '{func.__name__}'...")
     
@@ -90,6 +129,9 @@ def jit(func):
     ir_generator.visit(tree)
     cobra_ir = ir_generator.ir
     
+    # Get the names of the function's arguments
+    arg_names = inspect.getfullargspec(func).args
+
     print("[COBRA JIT] Generated Intermediate Representation (IR):")
     for instruction in cobra_ir:
         print(f"    {instruction}")
@@ -101,11 +143,11 @@ def jit(func):
         """The wrapper function that executes the 'compiled' code."""
         print(f"\n[COBRA JIT] Executing compiled function: '{func.__name__}'")
         
-        # In the future, an interpreter will execute the IR.
-        # For now, we still execute the original Python function.
-        result = func(*args, **kwargs)
+        # Create and run the interpreter instead of the original function.
+        interpreter = CobraIrInterpreter(cobra_ir, arg_names, args)
+        result = interpreter.run()
         
-        print(f"[COBRA JIT] Successfully executed function '{func.__name__}'.")
+        print(f"[COBRA JIT] Successfully executed IR for function '{func.__name__}'.")
         
         return result
         
