@@ -8,23 +8,28 @@ project(Cobra)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# --- Cobra C++ Core Library ---
 # Create a library for our core runtime.
-# For now, it's a STATIC library, meaning its code will be copied
-# directly into whatever program uses it.
 add_library(cobra_runtime STATIC
     src/memory/MemoryManager.cpp
 )
 
 # Tell CMake that our library's header files are located in the /src directory.
-# This allows our .cpp files to find them using #include "..."
 target_include_directories(cobra_runtime PUBLIC ${PROJECT_SOURCE_DIR}/src)
 
-# --- Test Harness ---
-# Define a new target, this time an executable program
-add_executable(cobra_test_runner
-    tests/main.cpp
+
+# --- Python Bindings ---
+# Find the pybind11 package that we added as a submodule
+add_subdirectory(tools/pybind11)
+
+# pybind11_add_module is a special function provided by pybind11.
+# It creates a Python module that is correctly configured for the current OS.
+# The first argument is the name of the module target: cobra_core
+# The second argument is the source file for the bindings.
+pybind11_add_module(cobra_core SHARED
+    src/bindings.cpp
 )
 
-# Link our test runner executable with our cobra_runtime library.
-# This makes the MemoryManager code available to our test runner.
-target_link_libraries(cobra_test_runner PRIVATE cobra_runtime)
+# Link our Python module with our cobra_runtime C++ library.
+# This makes the MemoryManager code available to the bindings.
+target_link_libraries(cobra_core PRIVATE cobra_runtime)
