@@ -25,8 +25,23 @@ class CobraIrGenerator(ast.NodeVisitor):
         return name
 
     def visit_FunctionDef(self, node):
-        """Handles the function definition."""
-        self.generic_visit(node)
+        """
+        Handles the function definition.
+        This version correctly identifies and skips the docstring.
+        """
+        # ast.get_docstring checks if the first node in the body is a
+        # string constant and returns it. We use this to decide if we
+        # should skip the first node.
+        docstring = ast.get_docstring(node)
+        
+        body_nodes = node.body
+        if docstring:
+            # If a docstring exists, it's the first node, so we skip it.
+            body_nodes = node.body[1:]
+
+        # Visit only the actual code statements.
+        for statement in body_nodes:
+            self.visit(statement)
 
     def visit_Assign(self, node):
         """Handles assignment statements (e.g., 'total = a + b')."""
