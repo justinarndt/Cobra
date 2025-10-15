@@ -18,3 +18,13 @@ add_library(cobra_runtime STATIC
 # Tell CMake that our library's header files are located in the /src directory.
 # This allows our .cpp files to find them using #include "..."
 target_include_directories(cobra_runtime PUBLIC ${PROJECT_SOURCE_DIR}/src)
+
+# --- Test Harness ---
+# Define a new target, this time an executable program
+add_executable(cobra_test_runner
+    tests/main.cpp
+)
+
+# Link our test runner executable with our cobra_runtime library.
+# This makes the MemoryManager code available to our test runner.
+target_link_libraries(cobra_test_runner PRIVATE cobra_runtime)
