@@ -4,7 +4,7 @@
 # system can now find the compiled C++ module automatically. All the
 # manual importlib logic is no longer needed and has been removed.
 
-from cobra.cobra_core.memory import MemoryManager, DeviceType
+from cobra.cobra_core import MemoryManager, DeviceType
 
 # Create a single, global instance of the MemoryManager.
 manager = MemoryManager.get_instance()
