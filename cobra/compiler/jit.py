@@ -46,6 +46,22 @@ class CobraIrGenerator(ast.NodeVisitor):
         value_source = self.visit(node.value)
         target = node.targets[0].id
         self.ir.append(Instruction('STORE', (target, value_source)))
+    
+    def visit_AugAssign(self, node):
+        """Handles augmented assignments (e.g., total += i)."""
+        # This is equivalent to: total = total + i
+        target_name = node.target.id
+        value_source = self.visit(node.value)
+        temp_result = self.fresh_temp()
+        
+        op_map = {ast.Add: 'ADD', ast.Sub: 'SUB', ast.Mult: 'MUL'}
+        opcode = op_map.get(type(node.op))
+        if not opcode:
+            raise NotImplementedError(f"Augmented assignment operator {type(node.op).__name__} not supported")
+            
+        self.ir.append(Instruction(opcode, (temp_result, target_name, value_source)))
+        self.ir.append(Instruction('STORE', (target_name, temp_result)))
+
 
     def visit_BinOp(self, node):
         """Handles binary operations."""
@@ -60,12 +76,12 @@ class CobraIrGenerator(ast.NodeVisitor):
         raise NotImplementedError(f"Operator {type(node.op).__name__} not supported")
 
     def visit_Compare(self, node):
-        """Handles comparison operations (e.g., a > b)."""
+        """Handles comparison operations."""
         left_source = self.visit(node.left)
         right_source = self.visit(node.comparators[0])
         target_temp = self.fresh_temp()
         
-        op_map = {ast.Gt: 'GT'} # Greater Than
+        op_map = {ast.Gt: 'GT', ast.Lt: 'LT'} # Greater Than, Less Than
         opcode = op_map.get(type(node.ops[0]))
         if opcode:
             self.ir.append(Instruction('COMPARE', (opcode, target_temp, left_source, right_source)))
@@ -97,6 +113,28 @@ class CobraIrGenerator(ast.NodeVisitor):
                 self.visit(stmt)
         
         self.ir.append(Instruction('LABEL', end_label))
+        
+    def visit_While(self, node):
+        """Handles while loops."""
+        header_label = self.fresh_label()
+        body_label = self.fresh_label()
+        exit_label = self.fresh_label()
+
+        self.ir.append(Instruction('JUMP', header_label))
+        self.ir.append(Instruction('LABEL', header_label))
+
+        # Evaluate the test condition
+        test_result_var = self.visit(node.test)
+        self.ir.append(Instruction('JUMP_IF_TRUE', (test_result_var, body_label, exit_label)))
+
+        # Loop body
+        self.ir.append(Instruction('LABEL', body_label))
+        for stmt in node.body:
+            self.visit(stmt)
+        self.ir.append(Instruction('JUMP', header_label)) # Jump back to the top
+
+        # Exit
+        self.ir.append(Instruction('LABEL', exit_label))
 
 
     def visit_Constant(self, node):
@@ -209,10 +247,12 @@ class CobraLlvmIrGenerator:
                 left_val = self.symbol_table[left_src]
                 right_val = self.symbol_table[right_src]
                 
+                op_map = {'GT': '>', 'LT': '<'}
+                
                 if isinstance(left_val.type, ir.DoubleType):
-                    self.symbol_table[target] = self.builder.fcmp_ordered('>', left_val, right_val, name=target)
+                    self.symbol_table[target] = self.builder.fcmp_ordered(op_map[op], left_val, right_val, name=target)
                 else:
-                    self.symbol_table[target] = self.builder.icmp_signed('>', left_val, right_val, name=target)
+                    self.symbol_table[target] = self.builder.icmp_signed(op_map[op], left_val, right_val, name=target)
 
             elif opcode == 'JUMP_IF_TRUE':
                 cond_var, then_label, else_label = arg
@@ -232,8 +272,6 @@ class CobraLlvmIrGenerator:
                     return_val = self.symbol_table[arg]
                     self.builder.ret(return_val)
 
-        # After the loop, check if the final block is unterminated.
-        # This can happen if all paths return early.
         last_block = self.function.blocks[-1]
         if not last_block.is_terminated:
             self.builder.position_at_end(last_block)
@@ -302,4 +340,3 @@ def jit(func):
     
     wrapper.engine = engine
     return wrapper
-
