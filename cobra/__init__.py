@@ -4,4 +4,7 @@
 # at the top-level package namespace.
 
 from .stdlib import CobraArray
-from .compiler import jit
+# This is the corrected import. It imports the 'jit' function
+# from within the 'compiler.jit' module.
+from .compiler.jit import jit
+
