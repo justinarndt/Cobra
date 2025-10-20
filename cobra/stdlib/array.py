@@ -3,8 +3,8 @@ from cobra.runtime import manager as memory_manager
 import ctypes
 
 # --- Capsule Handling Helper ---
-# This is the definitive fix. We use ctypes to access Python's own C-API
-# to correctly unwrap the py::capsule object and get the raw pointer address.
+# This uses ctypes to access Python's C-API to correctly unwrap the
+# py::capsule object and get the raw pointer address.
 PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
 PyCapsule_GetPointer.restype = ctypes.c_void_p
 PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
@@ -33,8 +33,6 @@ class CobraArray:
         # Copy data from the source numpy array to the newly allocated memory
         ctypes.memmove(self._data_ptr, self.array.ctypes.data, self.nbytes)
 
-        print(f"INFO [CobraArray.__init__]: Allocated {self.nbytes} bytes for array with shape {self.shape} on device {self.device}. Handle: {self._handle}")
-
     @property
     def _data_ptr(self):
         """
@@ -46,8 +44,8 @@ class CobraArray:
 
     def __del__(self):
         if hasattr(self, '_handle') and self._handle:
-            print(f"INFO [CobraArray.__del__]: Freeing memory for array with shape {self.shape} on device {self.device}. Handle: {self._handle}")
-            memory_manager.free(self._handle)
+            # The 'free' method now requires the device type to select the correct SYCL queue.
+            memory_manager.free(self._handle, self.device)
 
     def to_numpy(self):
         """Returns a NumPy array that is a copy of the data in this CobraArray."""

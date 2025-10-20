@@ -1,38 +1,15 @@
-#include "MemoryManager.h"
-#include <iostream>
+#include "memory/MemoryManager.h"
+
+// The implementation for the MemoryManager class is now defined inline
+// within the 'MemoryManager.h' header file. This is a common pattern for
+// modern C++ libraries that are heavily reliant on templates and header-only
+// APIs, such as SYCL.
+
+// This source file is intentionally kept minimal. Its primary purpose is to
+// provide a compilation unit for the 'cobra_runtime' library target in our
+// CMake build system. Any non-inline static member definitions or other
+// source-specific code would be placed here.
 
 namespace cobra {
-
-    MemoryManager& MemoryManager::getInstance() {
-        static MemoryManager instance;
-        return instance;
-    }
-
-    void* MemoryManager::allocate(size_t size, DeviceType device) {
-        const char* deviceName = (device == DeviceType::GPU) ? "GPU" : "CPU";
-        std::cout << "[MemoryManager] INFO: Requesting allocation of " << size
-                  << " bytes on device: " << deviceName << std::endl;
-
-        // --- CHANGE ---
-        // Instead of returning nullptr, we now allocate a single dummy byte
-        // on the C++ heap. This gives us a REAL, non-null pointer to use
-        // as a placeholder handle. We will use the size of the requested
-        // allocation to make the handle unique for this test.
-        char* dummy_handle = new char[size];
-        std::cout << "[MemoryManager] DEBUG: Created dummy handle at address "
-                  << static_cast<void*>(dummy_handle) << std::endl;
-        return dummy_handle;
-    }
-
-    void MemoryManager::free(void* ptr) {
-        std::cout << "[MemoryManager] INFO: Requesting to free memory at address "
-                  << ptr << std::endl;
-
-        // --- CHANGE ---
-        // Now that we are allocating real C++ memory, we must free it to
-        // prevent memory leaks. The 'delete[]' operator matches the 'new char[]'
-        // in the allocate function.
-        delete[] static_cast<char*>(ptr);
-    }
-
-} // namespace cobra
+    // Currently, no additional definitions are needed.
+}
