@@ -1,35 +1,38 @@
-# Set the minimum required version of CMake
+# Set the minimum required version of CMake.
 cmake_minimum_required(VERSION 3.10)
 
-# Set the project name
+# Set the project name.
 project(Cobra)
 
-# Set the C++ standard to C++17
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# --- Intel oneAPI / SYCL Integration ---
+# Find the SYCL package provided by the oneAPI DPC++/C++ Compiler installation.
+# This is the crucial step that locates the necessary headers and libraries.
+# It will define the SYCL_INCLUDE_DIRS and SYCL_LIBRARIES variables.
+find_package(SYCL REQUIRED)
+# ---------------------------------------
 
-# --- Cobra C++ Core Library ---
-# Create a library for our core runtime.
-add_library(cobra_runtime STATIC
-    src/memory/MemoryManager.cpp
-)
-
-# Tell CMake that our library's header files are located in the /src directory.
-target_include_directories(cobra_runtime PUBLIC ${PROJECT_SOURCE_DIR}/src)
-
-
-# --- Python Bindings ---
-# Find the pybind11 package that we added as a submodule
+# Add the pybind11 submodule, which we use for C++/Python bindings.
 add_subdirectory(tools/pybind11)
 
-# pybind11_add_module is a special function provided by pybind11.
-# It creates a Python module that is correctly configured for the current OS.
-# The first argument is the name of the module target: cobra_core
-# The second argument is the source file for the bindings.
-pybind11_add_module(cobra_core SHARED
-    src/bindings.cpp
+# --- Cobra Runtime Library (C++) ---
+# This static library contains the core C++ logic, like the MemoryManager.
+add_library(cobra_runtime src/memory/MemoryManager.cpp)
+
+# Add the necessary include directories for the runtime library.
+# We now add ${SYCL_INCLUDE_DIRS} to this list.
+target_include_directories(cobra_runtime PUBLIC
+    ${pybind11_INCLUDE_DIRS}
+    ${SYCL_INCLUDE_DIRS}
+    "${PROJECT_SOURCE_DIR}/src" # Include the top-level src directory
 )
 
-# Link our Python module with our cobra_runtime C++ library.
-# This makes the MemoryManager code available to the bindings.
+# Link the runtime library against the SYCL runtime libraries.
+target_link_libraries(cobra_runtime PUBLIC ${SYCL_LIBRARIES})
+
+# --- Cobra Core Python Module (Bindings) ---
+# This target uses pybind11 to create the final .pyd/.so file
+# that Python will import.
+pybind11_add_module(cobra_core src/bindings.cpp)
+
+# Link the Python module against our internal C++ runtime library.
 target_link_libraries(cobra_core PRIVATE cobra_runtime)
