@@ -1,57 +1,54 @@
 import numpy as np
 from cobra.runtime import manager as memory_manager
+import ctypes
 
 class CobraArray:
-    """
-    A multi-dimensional array object that manages memory on a specified device (CPU or GPU)
-    through the Cobra runtime.
-    """
+    """A dense, one-dimensional array object managed by the Cobra runtime."""
+
     def __init__(self, data, device=memory_manager.DeviceType.CPU):
-        """
-        Initializes a CobraArray.
-
-        For this phase, the actual data is NOT copied to the device. We are only
-        allocating the required memory and storing the array's metadata.
-
-        Args:
-            data: An object that can be converted to a NumPy array, like a list or tuple.
-            device: The target device for memory allocation (e.g., DeviceType.CPU).
-        """
-        # Use NumPy to easily handle data conversion, shape, and type.
-        _np_array = np.asarray(data)
-
-        self.shape = _np_array.shape
-        self.dtype = _np_array.dtype
+        if not isinstance(data, (list, np.ndarray)):
+            raise TypeError("Input data must be a list or NumPy array.")
+        
+        self.array = np.array(data, dtype=np.float64, order='C')
+        self.shape = self.array.shape
+        self.dtype = self.array.dtype
+        self.nbytes = self.array.nbytes
+        self.size = self.array.size
         self.device = device
-        self.nbytes = _np_array.nbytes
 
-        # Call our Python runtime wrapper to allocate memory on the C++ backend.
-        # The returned value is a placeholder handle to this memory.
         self._handle = memory_manager.allocate(self.nbytes, self.device)
+        
+        # Copy data from the source numpy array to the newly allocated memory
+        ctypes.memmove(self._data_ptr, self.array.ctypes.data, self.nbytes)
 
-        print(
-            f"INFO [CobraArray.__init__]: Allocated {self.nbytes} bytes for array with "
-            f"shape {self.shape} on device {self.device}. Handle: {self._handle}"
-        )
+        print(f"INFO [CobraArray.__init__]: Allocated {self.nbytes} bytes for array with shape {self.shape} on device {self.device}. Handle: {self._handle}")
+
+    @property
+    def _data_ptr(self):
+        """
+        A property that returns the raw memory address of the allocated data.
+        This is the crucial bridge that allows the JIT compiler to pass this
+        array's data to a native C function. It uses ctypes to interpret the
+        py::capsule handle as a raw pointer address (an integer).
+        """
+        return ctypes.cast(self._handle, ctypes.c_void_p).value
 
     def __del__(self):
-        """
-        The Python garbage collector calls this method when a CobraArray object
-        is no longer referenced. This is our chance to clean up the C++ memory.
-        """
-        if hasattr(self, '_handle') and self._handle is not None:
-            print(
-                f"INFO [CobraArray.__del__]: Freeing memory for array with "
-                f"shape {self.shape} on device {self.device}. Handle: {self._handle}"
-            )
-            # Call our Python runtime wrapper to free the memory on the C++ backend.
+        if hasattr(self, '_handle') and self._handle:
+            print(f"INFO [CobraArray.__del__]: Freeing memory for array with shape {self.shape} on device {self.device}. Handle: {self._handle}")
             memory_manager.free(self._handle)
 
+    def to_numpy(self):
+        """Returns a NumPy array that is a copy of the data in this CobraArray."""
+        # Create a ctypes pointer to the raw data
+        ptr_type = ctypes.POINTER(ctypes.c_double * self.size)
+        ptr = ctypes.cast(self._data_ptr, ptr_type)
+        # Create a NumPy array that views this memory (copy to be safe)
+        return np.copy(np.frombuffer(ptr.contents, dtype=np.float64))
+
     def __repr__(self):
-        """
-        Provides a clean, descriptive string representation of the object.
-        """
-        return (
-            f"<CobraArray shape={self.shape}, dtype={self.dtype}, "
-            f"device={self.device.name}>"
-        )
+        return f"<CobraArray shape={self.shape}, dtype={self.dtype.name}, device={self.device.name}>"
+
+    def __str__(self):
+        return str(self.to_numpy())
+
