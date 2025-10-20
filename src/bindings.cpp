@@ -16,9 +16,9 @@ PYBIND11_MODULE(cobra_core, m) {
         .value("GPU", cobra::DeviceType::GPU) // Expose GPU enum value as "DeviceType.GPU"
         .export_values(); // Make the enum values accessible in Python
 
-    // Expose the MemoryManager class to Python
-    // We give it the name "MemoryManager" in Python
-    py::class_<cobra::MemoryManager>(m, "MemoryManager")
+    // Expose the MemoryManager class to Python.
+    // The 'py::dynamic_attr()' tag is passed to the constructor to enable Python-side attribute assignment.
+    py::class_<cobra::MemoryManager>(m, "MemoryManager", py::dynamic_attr())
         // We can't create a MemoryManager from Python, so no constructor is exposed.
         // Instead, we expose the getInstance() static method.
         .def_static("get_instance", &cobra::MemoryManager::getInstance,
@@ -30,10 +30,6 @@ PYBIND11_MODULE(cobra_core, m) {
         .def("allocate", &cobra::MemoryManager::allocate, "Allocates a block of memory")
 
         // Expose the free method. We rename it to "free" in Python.
-        .def("free", &cobra::MemoryManager::free, "Frees a block of memory")
-
-        // --- THE FIX ---
-        // This line enables dynamic attributes, allowing us to "graft" the
-        // DeviceType enum onto the manager object from Python.
-        .def(py::dynamic_attr());
+        .def("free", &cobra::MemoryManager::free, "Frees a block of memory");
 }
+
