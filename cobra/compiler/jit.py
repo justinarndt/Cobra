@@ -11,7 +11,7 @@ from llvmlite import ir, binding
 from cobra.stdlib import CobraArray
 
 # --- Global JIT Registry ---
-# This cache will store metadata about compiled functions, allowing them
+# This cache stores metadata about compiled functions, allowing them
 # to find and call each other. The key is the original Python function object.
 _JIT_REGISTRY = {}
 # ---------------------------
@@ -160,7 +160,12 @@ class CobraLlvmIrGenerator:
         self._infer_types()
 
         func_type = ir.FunctionType(self.return_type, self.arg_types)
-        self.function = ir.Function(self.module, func_type, name=f"cobra_{func_name}")
+        # Check if the function already exists in the module before creating it
+        if not any(f.name == f"cobra_{func_name}" for f in self.module.functions):
+             self.function = ir.Function(self.module, func_type, name=f"cobra_{func_name}")
+        else:
+             self.function = self.module.get_global(f"cobra_{func_name}")
+
         i = 0
         for name, type_info in zip(self.arg_names, self.arg_types_info):
             if type_info == 'CobraArray':
@@ -187,9 +192,8 @@ class CobraLlvmIrGenerator:
             elif opcode == 'LOAD_ATTR': var_types[arg[0]] = 'int' # arr.size
             elif opcode == 'LOAD_ELEMENT': var_types[arg[0]] = 'float'
             elif opcode == 'CALL':
-                # For now, assume return type based on first arg type of called function
-                # A more robust system would look up the function's actual signature
-                var_types[arg[0]] = 'int' # Placeholder
+                 # This needs a proper signature lookup in a real compiler
+                 var_types[arg[0]] = 'int'
 
         self.return_type_str = var_types.get(return_var, 'int') if return_var else 'void'
         self.arg_types = []
@@ -204,11 +208,19 @@ class CobraLlvmIrGenerator:
             if type_str != 'CobraArray': self.type_map[name] = type_str_map.get(type_str)
 
     def _get_value(self, name):
+        """
+        Retrieves a value from the symbol table. If the symbol is a pointer
+        to a scalar value (e.g. an alloca), it loads the value.
+        Raw array data pointers (ending in .data) are returned as-is.
+        """
         if name is None: return None
         val = self.symbol_table.get(name)
         if val is None: raise NameError(f"Variable '{name}' not found.")
-        if isinstance(val.type, ir.PointerType) and val.type.pointee != self.double_ptr_type:
+        
+        # If the symbol is a pointer AND not a special raw data pointer, load it.
+        if isinstance(val.type, ir.PointerType) and not name.endswith('.data'):
             return self.builder.load(val, name=f"{name}.val")
+            
         return val
 
     def generate(self):
@@ -222,14 +234,16 @@ class CobraLlvmIrGenerator:
                 self.symbol_table[f"{name}.size"] = self.function.args[arg_idx+1]
                 arg_idx += 2
             else:
-                self.symbol_table[name] = self.function.args[arg_idx]
+                 # Check if the arg needs to be mutable (has a STORE operation)
+                is_mutable = any(opcode == 'STORE' and arg[0] == name for opcode, arg in self.cobra_ir)
+                if is_mutable:
+                    # Allocate space for mutable args and store the initial value
+                    alloc = self.builder.alloca(self.type_map[name], name=name)
+                    self.builder.store(self.function.args[arg_idx], alloc)
+                    self.symbol_table[name] = alloc
+                else:
+                    self.symbol_table[name] = self.function.args[arg_idx]
                 arg_idx += 1
-        
-        mutable_vars = {arg[0] for opcode, arg in self.cobra_ir if opcode == 'STORE'}
-        for var_name in mutable_vars:
-            if var_name not in self.arg_names:
-                var_type = self.type_map.get(var_name, ir.IntType(64))
-                self.symbol_table[var_name] = self.builder.alloca(var_type, name=var_name)
         
         self.builder.position_at_end(self.entry_block)
         
@@ -280,7 +294,6 @@ class CobraLlvmIrGenerator:
                     self.symbol_table[target] = self.builder.icmp_signed(op_map[op], left_val, right_val, name=target)
             elif opcode == 'CALL':
                 target, func_name, arg_sources = arg
-                # Find the target function in the LLVM module
                 target_func = self.module.get_global(f"cobra_{func_name}")
                 if target_func is None:
                     raise NameError(f"JIT function '{func_name}' not found in current module.")
@@ -304,14 +317,30 @@ class CobraLlvmIrGenerator:
 
         return self.function
 
+def _compile_function(py_func, arg_types_info, module):
+    """Helper to compile a single Python function into a shared LLVM module."""
+    func_name = py_func.__name__
+
+    # Check if this specific specialization is already in the module
+    if any(f.name == f"cobra_{func_name}" for f in module.functions):
+        return module.get_global(f"cobra_{func_name}")
+
+    source_code = inspect.getsource(py_func)
+    tree = ast.parse(source_code)
+    arg_names = inspect.getfullargspec(py_func).args
+
+    ir_generator = CobraIrGenerator()
+    ir_generator.visit(tree)
+    cobra_ir = ir_generator.ir
+    
+    llvm_ir_generator = CobraLlvmIrGenerator(cobra_ir, arg_names, arg_types_info, func_name, module)
+    return llvm_ir_generator.generate()
+
 def jit(func):
     """
     A decorator that performs type-specialized JIT compilation via LLVM.
     """
-    # Register the original Python function.
     _JIT_REGISTRY[func.__name__] = func
-    
-    # This cache stores compiled specializations: { (arg_types_tuple): (cfunc, engine) }
     func._jit_cache = {}
 
     @functools.wraps(func)
@@ -321,43 +350,48 @@ def jit(func):
                                'int' for arg in args)
 
         if arg_types_info in func._jit_cache:
-            cfunc, engine, module = func._jit_cache[arg_types_info]
+            cfunc, engine = func._jit_cache[arg_types_info]
         else:
-            func_name = func.__name__
-            print(f"[COBRA JIT] Compiling new specialization for '{func_name}' with types {arg_types_info}...")
+            main_func_name = func.__name__
+            print(f"[COBRA JIT] Compiling new specialization for '{main_func_name}' with types {arg_types_info}...")
             
-            # --- New: Create a shared LLVM module and binding for this compilation session ---
-            binding.initialize_native_target()
-            binding.initialize_native_asmprinter()
-            module = ir.Module(name=f"cobra_module_{func_name}")
-            target_machine = binding.Target.from_default_triple().create_target_machine()
-            # -----------------------------------------------------------------------------------
-
-            # Find all functions that might be called and compile them first
-            source_code = inspect.getsource(func)
-            tree = ast.parse(source_code)
+            # --- Unified Compilation Session ---
+            module = ir.Module(name=f"cobra_module_{main_func_name}")
             
-            # This is a simplification. A real compiler would build a full dependency graph.
-            # We look for all functions called by this one and ensure they are compiled.
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                    callee_name = node.func.id
-                    if callee_name in _JIT_REGISTRY and callee_name != func_name:
-                         # This recursive call ensures the dependency is compiled first for the same types
-                         # NOTE: This is a major simplification and assumes same types!
-                         _JIT_REGISTRY[callee_name](*args)
-
-
-            arg_names = inspect.getfullargspec(func).args
-            ir_generator = CobraIrGenerator()
-            ir_generator.visit(tree)
-            cobra_ir = ir_generator.ir
+            # 1. Discover dependency graph
+            dependencies = set()
+            to_process = [func]
+            processed = set()
+            while to_process:
+                current_func = to_process.pop(0)
+                if current_func in processed: continue
+                processed.add(current_func)
+                
+                source_code = inspect.getsource(current_func)
+                tree = ast.parse(source_code)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                        callee_name = node.func.id
+                        if callee_name in _JIT_REGISTRY:
+                            callee_func = _JIT_REGISTRY[callee_name]
+                            dependencies.add(callee_func)
+                            to_process.append(callee_func)
             
-            llvm_ir_generator = CobraLlvmIrGenerator(cobra_ir, arg_names, arg_types_info, func_name, module)
-            llvm_function = llvm_ir_generator.generate()
+            # 2. Compile dependencies into the shared module
+            for dep_func in dependencies:
+                # This is a simplification; assumes dependencies have same arg types
+                _compile_function(dep_func, arg_types_info, module)
+
+            # 3. Compile the main function into the shared module
+            main_llvm_func = _compile_function(func, arg_types_info, module)
             
             print("\n[COBRA JIT] Generated LLVM IR:")
             print(str(module))
+
+            # 4. Compile the entire module
+            binding.initialize_native_target()
+            binding.initialize_native_asmprinter()
+            target_machine = binding.Target.from_default_triple().create_target_machine()
             
             llvm_module = binding.parse_assembly(str(module))
             llvm_module.verify()
@@ -365,7 +399,7 @@ def jit(func):
             engine = binding.create_mcjit_compiler(llvm_module, target_machine)
             engine.finalize_object()
             
-            func_ptr = engine.get_function_address(llvm_function.name)
+            func_ptr = engine.get_function_address(main_llvm_func.name)
 
             cfunc_arg_types = []
             for t_info in arg_types_info:
@@ -373,14 +407,13 @@ def jit(func):
                 elif t_info == 'float': cfunc_arg_types.append(ctypes.c_double)
                 else: cfunc_arg_types.append(ctypes.c_int64)
 
-            ret_type = llvm_ir_generator.return_type
             cfunc_return_type = None
-            if isinstance(ret_type, ir.IntType) and ret_type.width == 64: cfunc_return_type = ctypes.c_int64
-            elif isinstance(ret_type, ir.DoubleType): cfunc_return_type = ctypes.c_double
+            if isinstance(main_llvm_func.return_value.type, ir.IntType): cfunc_return_type = ctypes.c_int64
+            elif isinstance(main_llvm_func.return_value.type, ir.DoubleType): cfunc_return_type = ctypes.c_double
 
             cfunc = ctypes.CFUNCTYPE(cfunc_return_type, *cfunc_arg_types)(func_ptr)
             
-            func._jit_cache[arg_types_info] = (cfunc, engine, module)
+            func._jit_cache[arg_types_info] = (cfunc, engine)
             print("[COBRA JIT] Compilation to native code complete.")
 
         native_args = []
@@ -389,7 +422,7 @@ def jit(func):
             else: native_args.append(arg)
 
         print(f"\n[COBRA JIT] Executing native code for function: '{func.__name__}' with types {arg_types_info}")
-        result = cfunc(*native_args)
+        result = cfunc(*args)
         print("[COBRA JIT] Successfully executed native code.")
         return result
     
