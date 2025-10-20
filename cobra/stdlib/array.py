@@ -2,6 +2,18 @@ import numpy as np
 from cobra.runtime import manager as memory_manager
 import ctypes
 
+# --- Capsule Handling Helper ---
+# This is the definitive fix. We use ctypes to access Python's own C-API
+# to correctly unwrap the py::capsule object and get the raw pointer address.
+PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
+PyCapsule_GetPointer.restype = ctypes.c_void_p
+PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+def get_pointer_from_capsule(capsule):
+    """Extracts the raw memory address from a py::capsule object."""
+    return PyCapsule_GetPointer(capsule, None)
+# -----------------------------
+
 class CobraArray:
     """A dense, one-dimensional array object managed by the Cobra runtime."""
 
@@ -27,11 +39,10 @@ class CobraArray:
     def _data_ptr(self):
         """
         A property that returns the raw memory address of the allocated data.
-        This is the crucial bridge that allows the JIT compiler to pass this
-        array's data to a native C function. It uses ctypes to interpret the
-        py::capsule handle as a raw pointer address (an integer).
+        It uses our helper function to correctly unwrap the C++ pointer from
+        the py::capsule handle.
         """
-        return ctypes.cast(self._handle, ctypes.c_void_p).value
+        return get_pointer_from_capsule(self._handle)
 
     def __del__(self):
         if hasattr(self, '_handle') and self._handle:
