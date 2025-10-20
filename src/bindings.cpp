@@ -8,7 +8,7 @@ namespace py = pybind11;
 // The second argument, m, is a variable of type py::module_ that is the main interface for creating bindings.
 PYBIND11_MODULE(cobra_core, m) {
     // Optional: Add a docstring to the module
-    m.doc() = "Core C++ components of the Cobra runtime";
+    m.doc() = "Core C++ components of the Cobra runtime, now with oneAPI/SYCL support.";
 
     // Expose the DeviceType enum to Python
     py::enum_<cobra::DeviceType>(m, "DeviceType")
@@ -17,7 +17,7 @@ PYBIND11_MODULE(cobra_core, m) {
         .export_values(); // Make the enum values accessible in Python
 
     // Expose the MemoryManager class to Python.
-    // The 'py::dynamic_attr()' tag is passed to the constructor to enable Python-side attribute assignment.
+    // The 'py::dynamic_attr()' tag is passed to the class constructor to enable Python-side attribute assignment.
     py::class_<cobra::MemoryManager>(m, "MemoryManager", py::dynamic_attr())
         // We can't create a MemoryManager from Python, so no constructor is exposed.
         // Instead, we expose the getInstance() static method.
@@ -26,10 +26,14 @@ PYBIND11_MODULE(cobra_core, m) {
                     // to the existing instance, not a copy.
                     py::return_value_policy::reference)
 
-        // Expose the allocate method. We rename it to "allocate" in Python.
-        .def("allocate", &cobra::MemoryManager::allocate, "Allocates a block of memory")
+        // --- THE WARM-UP FIX ---
+        // Expose the new warm_up method to Python.
+        .def("warm_up", &cobra::MemoryManager::warm_up, "Initializes the SYCL runtime and queues safely.")
 
-        // Expose the free method. We rename it to "free" in Python.
-        .def("free", &cobra::MemoryManager::free, "Frees a block of memory");
+        // Expose the allocate method. We rename it to "allocate" in Python.
+        .def("allocate", &cobra::MemoryManager::allocate, "Allocates a block of USM memory")
+
+        // Expose the free method. It now takes a DeviceType argument.
+        .def("free", &cobra::MemoryManager::free, "Frees a block of USM memory");
 }
 

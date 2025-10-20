@@ -24,6 +24,13 @@ namespace cobra {
             return instance;
         }
 
+        // --- THE WARM-UP FIX ---
+        // This new public method will be called explicitly from Python to safely
+        // trigger the one-time SYCL runtime initialization.
+        void warm_up() {
+            get_queue(DeviceType::CPU);
+        }
+
         void* allocate(size_t bytes, DeviceType device) {
             sycl::queue& q = get_queue(device);
             void* ptr = sycl::malloc_shared(bytes, q);
@@ -41,7 +48,7 @@ namespace cobra {
         }
 
     private:
-        // The constructor is empty to prevent work during DLL load.
+        // The constructor remains empty. No work is done on DLL load.
         MemoryManager() = default;
 
         // This method performs the one-time initialization of SYCL queues.
