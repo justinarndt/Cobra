@@ -1,89 +1,78 @@
-#ifndef COBRA_MEMORY_MANAGER_H
-#define COBRA_MEMORY_MANAGER_H
+// src/memory/MemoryManager.h
+//
+// Defines the interface for the core C++ MemoryManager singleton.
+// This class is responsible for the entire lifecycle of the SYCL/Level Zero
+// runtime, including device initialization, memory allocation, and kernel execution.
 
+#ifndef MEMORY_MANAGER_H
+#define MEMORY_MANAGER_H
+
+#include <vector>
+#include <cstdint>
 #include <stdexcept>
-#include <optional>
-#include <mutex>
+#include <ze_api.h> // The oneAPI Level Zero header
 
-#include <sycl/sycl.hpp>
+class MemoryManager {
+public:
+    // ========================================================================
+    // Lifecycle Management (The Deadlock Fix)
+    // ========================================================================
 
-namespace cobra {
+    // Creates the singleton instance and initializes the Level Zero runtime.
+    static void initialize();
 
-    enum class DeviceType {
-        CPU,
-        GPU
-    };
+    // Destroys the singleton instance and shuts down the runtime.
+    static void shutdown();
 
-    class MemoryManager {
-    public:
-        MemoryManager(const MemoryManager&) = delete;
-        MemoryManager& operator=(const MemoryManager&) = delete;
+    // Provides access to the singleton instance.
+    // Throws an error if the manager has not been initialized.
+    static MemoryManager& getInstance();
 
-        static MemoryManager& getInstance() {
-            static MemoryManager instance;
-            return instance;
-        }
+    // ========================================================================
+    // Core Functionality
+    // ========================================================================
 
-        // --- THE WARM-UP FIX ---
-        // This new public method will be called explicitly from Python to safely
-        // trigger the one-time SYCL runtime initialization.
-        void warm_up() {
-            get_queue(DeviceType::CPU);
-        }
+    // Allocates a block of memory on the GPU device.
+    void* allocate(size_t size);
 
-        void* allocate(size_t bytes, DeviceType device) {
-            sycl::queue& q = get_queue(device);
-            void* ptr = sycl::malloc_shared(bytes, q);
-            if (!ptr) {
-                throw std::runtime_error("Failed to allocate USM memory.");
-            }
-            return ptr;
-        }
+    // Frees a block of device memory.
+    void free(void* ptr);
 
-        void free(void* ptr, DeviceType device) {
-            if (ptr) {
-                sycl::queue& q = get_queue(device);
-                sycl::free(ptr, q);
-            }
-        }
+    // Loads a SPIR-V binary onto the device, creating a runnable module.
+    void loadKernel(const std::vector<uint32_t>& spirv_binary, const char* kernelName);
 
-    private:
-        // The constructor remains empty. No work is done on DLL load.
-        MemoryManager() = default;
+    // Launches the most recently loaded kernel.
+    // (A real implementation would take more arguments for kernel args, grid size etc.)
+    void launchKernel();
 
-        // This method performs the one-time initialization of SYCL queues.
-        void initialize_queues() {
-            try {
-                cpu_queue.emplace(sycl::cpu_selector_v);
-            } catch (const sycl::exception&) {
-                // Suppress errors if a device is not found.
-            }
-            try {
-                gpu_queue.emplace(sycl::gpu_selector_v);
-            } catch (const sycl::exception&) {
-                // Suppress errors if a device is not found.
-            }
-        }
 
-        // Returns the appropriate SYCL queue, initializing on first call.
-        sycl::queue& get_queue(DeviceType device) {
-            // Use a thread-safe, one-time call to initialize the queues.
-            std::call_once(init_flag, &MemoryManager::initialize_queues, this);
+private:
+    // The private static pointer that holds the single instance.
+    static MemoryManager* s_instance;
 
-            if (device == DeviceType::GPU && gpu_queue.has_value()) {
-                return gpu_queue.value();
-            }
-            if (cpu_queue.has_value()){
-                return cpu_queue.value();
-            }
-            throw std::runtime_error("No valid SYCL queue available.");
-        }
+    // The constructor is private to enforce the singleton pattern.
+    // It performs the actual one-time setup of the Level Zero runtime.
+    MemoryManager();
 
-        std::optional<sycl::queue> cpu_queue;
-        std::optional<sycl::queue> gpu_queue;
-        std::once_flag init_flag;
-    };
+    // The destructor is private and handles the cleanup of all runtime resources.
+    ~MemoryManager();
 
-} // namespace cobra
+    // Disable copy and assign constructors to prevent multiple instances.
+    MemoryManager(const MemoryManager&) = delete;
+    MemoryManager& operator=(const MemoryManager&) = delete;
 
-#endif // COBRA_MEMORY_MANAGER_H
+    // ========================================================================
+    // Private Member Variables (Level Zero Handles)
+    // ========================================================================
+    // These handles represent the state of our connection to the hardware.
+
+    ze_driver_handle_t m_driver_handle;
+    ze_device_handle_t m_device_handle;
+    ze_context_handle_t m_context_handle;
+    ze_command_queue_handle_t m_command_queue;
+    ze_command_list_handle_t m_command_list;
+    ze_module_handle_t m_module_handle;
+    ze_kernel_handle_t m_kernel_handle;
+};
+
+#endif // MEMORY_MANAGER_H
