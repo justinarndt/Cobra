@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"C:/Cobra/build/cmake_install.cmake",
-		"C:/Cobra/build/tools/pybind11/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
