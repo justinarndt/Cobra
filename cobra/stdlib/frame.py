@@ -1,8 +1,4 @@
-# cobra/stdlib/frame.py
-#
-# This file implements the CobraFrame, a JIT-compilable DataFrame object
-# designed to provide a familiar, pandas-like API while enabling massive
-# performance gains through its lazy evaluation and kernel fusion engine.
+# MODIFIED: cobra/stdlib/frame.py
 
 from .array import CobraArray
 
@@ -22,13 +18,39 @@ class CobraFrame:
         if not isinstance(data, dict):
             raise TypeError("CobraFrame must be initialized with a dictionary.")
 
-        # The internal storage is a dictionary of column names to CobraArrays.
         self._data = {name: CobraArray(values) for name, values in data.items()}
         self._columns = list(data.keys())
 
     def __repr__(self):
-        # A simple representation for the frame.
-        # A real implementation would be more sophisticated, like pandas.
         header = " | ".join(f"{col:<10}" for col in self._columns)
         divider = "-" * len(header)
+        # A real implementation would show some data rows.
         return f"{header}\n{divider}"
+
+    def __getitem__(self, key):
+        """
+        Retrieves a column by its name.
+        
+        Args:
+            key (str): The name of the column.
+            
+        Returns:
+            CobraArray: The array object for the requested column.
+        """
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        """
+        Assigns a new column or overwrites an existing one. The value can
+        be a literal, a CobraArray, or crucially, an Expression Tree node
+        which represents a pending computation.
+        
+        Args:
+            key (str): The name of the new or existing column.
+            value: The data or computation to assign.
+        """
+        # When an expression tree is assigned, it's stored directly. The JIT
+        # compiler will handle its evaluation later.
+        self._data[key] = value
+        if key not in self._columns:
+            self._columns.append(key)
