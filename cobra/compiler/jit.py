@@ -1,430 +1,202 @@
 # cobra/compiler/jit.py
+#
+# This file implements the Python frontend of the JIT compiler. Its main
+# responsibilities are:
+# 1. The user-facing `@cobra.jit` decorator that intercepts function calls.
+# 2. An AST Visitor (`JitAstVisitor`) that analyzes the decorated function's
+#    source code to find CobraFrame assignments.
+# 3. An expression tree traverser (`_traverse_expr_tree`) that converts a
+#    CobraFrame computation into a fused C-like kernel body string.
+# 4. A generator that emits the final MLIR text for the `cobra.fused_kernel`
+#    operation, which is then sent to the C++ backend for compilation.
 
-import functools
 import inspect
 import ast
-import ctypes
-from collections import namedtuple
+from .expr import ExprNode, BinaryOpNode, UnaryOpNode, ColumnNode, LiteralNode
 
-from llvmlite import ir, binding
+# A real implementation would get this from the C++ runtime binding.
+# from ..runtime import manager
 
-from cobra.stdlib import CobraArray
+# ============================================================================
+# Step 1: Expression Tree Traversal
+# ============================================================================
 
-# --- Global JIT Registry ---
-# This cache stores metadata about compiled functions, allowing them
-# to find and call each other. The key is the original Python function object.
-_JIT_REGISTRY = {}
-# ---------------------------
-
-Instruction = namedtuple('Instruction', ['opcode', 'arg'])
-
-
-class CobraIrGenerator(ast.NodeVisitor):
+def _traverse_expr_tree(node: ExprNode, input_map: dict) -> str:
     """
-    AST visitor that generates a linear Intermediate Representation (IR).
+    Recursively traverses an expression tree and generates a C-like string
+    for the fused kernel's body, replacing column names with generic
+    input/output variable names like `in0`, `in1`, etc.
+
+    Args:
+        node: The current node of the expression tree to traverse.
+        input_map: A dictionary mapping column names to generic names (e.g., {'a': 'in0'}).
+
+    Returns:
+        A string representing the computation (e.g., "((in0 + in1) * 2.0)").
     """
-    def __init__(self):
-        self.ir = []
-        self._temp_count = 0
-        self._label_count = 0
+    if isinstance(node, BinaryOpNode):
+        left_str = _traverse_expr_tree(node.left, input_map)
+        right_str = _traverse_expr_tree(node.right, input_map)
+        return f"({left_str} {node.op} {right_str})"
 
-    def fresh_temp(self):
-        name = f"t{self._temp_count}"
-        self._temp_count += 1
-        return name
+    elif isinstance(node, UnaryOpNode):
+        operand_str = _traverse_expr_tree(node.operand, input_map)
+        # A full implementation would map op to function names like 'exp', 'log'
+        return f"{node.op}({operand_str})"
 
-    def fresh_label(self):
-        name = f"L{self._label_count}"
-        self._label_count += 1
-        return name
+    elif isinstance(node, ColumnNode):
+        # Look up the column's placeholder name (e.g., 'a') and return
+        # its corresponding generic kernel argument name (e.g., 'in0').
+        return input_map.get(node.name, "UNKNOWN_COLUMN")
 
-    def visit_FunctionDef(self, node):
-        docstring = ast.get_docstring(node)
-        body_nodes = node.body[1:] if docstring else node.body
-        for statement in body_nodes:
-            self.visit(statement)
+    elif isinstance(node, LiteralNode):
+        return str(node.value)
 
-    def visit_Assign(self, node):
-        if isinstance(node.targets[0], ast.Subscript):
-            array_name = node.targets[0].value.id
-            index_var = self.visit(node.targets[0].slice)
-            value_source = self.visit(node.value)
-            self.ir.append(Instruction('STORE_ELEMENT', (array_name, index_var, value_source)))
-        else:
-            value_source = self.visit(node.value)
-            target = node.targets[0].id
-            self.ir.append(Instruction('STORE', (target, value_source)))
-
-    def visit_AugAssign(self, node):
-        target_name = node.target.id
-        value_source = self.visit(node.value)
-        temp_result = self.fresh_temp()
-        op_map = {ast.Add: 'ADD', ast.Sub: 'SUB', ast.Mult: 'MUL'}
-        opcode = op_map.get(type(node.op))
-        if not opcode:
-            raise NotImplementedError(f"Augmented assignment operator {type(node.op).__name__} not supported")
-        self.ir.append(Instruction(opcode, (temp_result, target_name, value_source)))
-        self.ir.append(Instruction('STORE', (target_name, temp_result)))
-
-    def visit_BinOp(self, node):
-        left_source = self.visit(node.left)
-        right_source = self.visit(node.right)
-        target_temp = self.fresh_temp()
-        op_map = {ast.Add: 'ADD', ast.Sub: 'SUB', ast.Mult: 'MUL'}
-        opcode = op_map.get(type(node.op))
-        if opcode:
-            self.ir.append(Instruction(opcode, (target_temp, left_source, right_source)))
-            return target_temp
-        raise NotImplementedError(f"Operator {type(node.op).__name__} not supported")
-
-    def visit_Compare(self, node):
-        left_source = self.visit(node.left)
-        right_source = self.visit(node.comparators[0])
-        target_temp = self.fresh_temp()
-        op_map = {ast.Gt: 'GT', ast.Lt: 'LT'}
-        opcode = op_map.get(type(node.ops[0]))
-        if opcode:
-            self.ir.append(Instruction('COMPARE', (opcode, target_temp, left_source, right_source)))
-            return target_temp
-        raise NotImplementedError(f"Comparison {type(node.ops[0]).__name__} not supported")
-
-    def visit_Call(self, node):
-        """Handles function calls (e.g., add_one(x))."""
-        func_name = node.func.id
-        arg_sources = [self.visit(arg) for arg in node.args]
-        target_temp = self.fresh_temp()
-        self.ir.append(Instruction('CALL', (target_temp, func_name, arg_sources)))
-        return target_temp
-
-    def visit_If(self, node):
-        test_result_var = self.visit(node.test)
-        then_label, else_label = self.fresh_label(), self.fresh_label()
-        end_label = self.fresh_label() if node.orelse else else_label
-        jump_else_label = else_label if node.orelse else end_label
-        self.ir.append(Instruction('JUMP_IF_TRUE', (test_result_var, then_label, jump_else_label)))
-        self.ir.append(Instruction('LABEL', then_label))
-        for stmt in node.body: self.visit(stmt)
-        if node.orelse: self.ir.append(Instruction('JUMP', end_label))
-        if node.orelse:
-            self.ir.append(Instruction('LABEL', else_label))
-            for stmt in node.orelse: self.visit(stmt)
-        self.ir.append(Instruction('LABEL', end_label))
-
-    def visit_While(self, node):
-        header_label, body_label, exit_label = self.fresh_label(), self.fresh_label(), self.fresh_label()
-        self.ir.append(Instruction('JUMP', header_label))
-        self.ir.append(Instruction('LABEL', header_label))
-        test_result_var = self.visit(node.test)
-        self.ir.append(Instruction('JUMP_IF_TRUE', (test_result_var, body_label, exit_label)))
-        self.ir.append(Instruction('LABEL', body_label))
-        for stmt in node.body: self.visit(stmt)
-        self.ir.append(Instruction('JUMP', header_label))
-        self.ir.append(Instruction('LABEL', exit_label))
-
-    def visit_Attribute(self, node):
-        source_var, attr_name = node.value.id, node.attr
-        target_temp = self.fresh_temp()
-        self.ir.append(Instruction('LOAD_ATTR', (target_temp, source_var, attr_name)))
-        return target_temp
-
-    def visit_Subscript(self, node):
-        array_name, index_var = node.value.id, self.visit(node.slice)
-        target_temp = self.fresh_temp()
-        self.ir.append(Instruction('LOAD_ELEMENT', (target_temp, array_name, index_var)))
-        return target_temp
-
-    def visit_Constant(self, node):
-        target_temp = self.fresh_temp()
-        self.ir.append(Instruction('LOAD_CONST', (target_temp, node.value)))
-        return target_temp
-
-    def visit_Name(self, node):
-        return node.id
-
-    def visit_Return(self, node):
-        value_source = self.visit(node.value) if node.value else None
-        self.ir.append(Instruction('RETURN', value_source))
+    else:
+        raise TypeError(f"Unknown expression tree node type: {type(node)}")
 
 
-class CobraLlvmIrGenerator:
-    """Translates Cobra IR into LLVM IR."""
-    def __init__(self, cobra_ir, arg_names, arg_types_info, func_name, module):
-        self.cobra_ir = cobra_ir
-        self.arg_names = arg_names
-        self.arg_types_info = arg_types_info
-        self.func_name = func_name
-        self.module = module  # Use the shared module
-        self.symbol_table = {}
-        self.type_map = {}
-        self.double_ptr_type = ir.DoubleType().as_pointer()
-        self._infer_types()
+# ============================================================================
+# Step 2: Python AST Analysis
+# ============================================================================
 
-        func_type = ir.FunctionType(self.return_type, self.arg_types)
-        # Check if the function already exists in the module before creating it
-        if not any(f.name == f"cobra_{func_name}" for f in self.module.functions):
-             self.function = ir.Function(self.module, func_type, name=f"cobra_{func_name}")
-        else:
-             self.function = self.module.get_global(f"cobra_{func_name}")
+class JitAstVisitor(ast.NodeVisitor):
+    """
+    Visits the AST of a JIT-decorated function to find assignments to
+    CobraFrame columns and extracts the associated expression tree.
+    """
+    def __init__(self, frame_name: str, frame_obj):
+        self.frame_name = frame_name
+        self.frame_obj = frame_obj
+        self.mlir_ops = []
 
-        i = 0
-        for name, type_info in zip(self.arg_names, self.arg_types_info):
-            if type_info == 'CobraArray':
-                self.function.args[i].name, self.function.args[i+1].name = f"{name}_data", f"{name}_size"
-                i += 2
-            else:
-                self.function.args[i].name = name
-                i += 1
-        self.entry_block = self.function.append_basic_block(name="entry")
-        self.builder = ir.IRBuilder(self.entry_block)
-        self.llvm_labels = {}
-
-    def _infer_types(self):
-        var_types = {name: type_info for name, type_info in zip(self.arg_names, self.arg_types_info)}
-        return_var = next((arg for opcode, arg in reversed(self.cobra_ir) if opcode == 'RETURN'), None)
-        
-        for opcode, arg in self.cobra_ir:
-            if opcode == 'STORE': var_types[arg[0]] = var_types.get(arg[1], 'int')
-            elif opcode == 'LOAD_CONST': var_types[arg[0]] = 'float' if isinstance(arg[1], float) else 'int'
-            elif opcode == 'COMPARE': var_types[arg[1]] = 'bool'
-            elif opcode in ('ADD', 'SUB', 'MUL'):
-                is_float = any(var_types.get(op, 'int') == 'float' for op in arg[1:])
-                var_types[arg[0]] = 'float' if is_float else 'int'
-            elif opcode == 'LOAD_ATTR': var_types[arg[0]] = 'int' # arr.size
-            elif opcode == 'LOAD_ELEMENT': var_types[arg[0]] = 'float'
-            elif opcode == 'CALL':
-                 # This needs a proper signature lookup in a real compiler
-                 var_types[arg[0]] = 'int'
-
-        self.return_type_str = var_types.get(return_var, 'int') if return_var else 'void'
-        self.arg_types = []
-        for type_info in self.arg_types_info:
-            if type_info == 'CobraArray': self.arg_types.extend([self.double_ptr_type, ir.IntType(64)])
-            elif type_info == 'float': self.arg_types.append(ir.DoubleType())
-            else: self.arg_types.append(ir.IntType(64))
-
-        type_str_map = {'int': ir.IntType(64), 'float': ir.DoubleType(), 'bool': ir.IntType(1), 'void': ir.VoidType()}
-        self.return_type = type_str_map.get(self.return_type_str, ir.IntType(64))
-        for name, type_str in var_types.items():
-            if type_str != 'CobraArray': self.type_map[name] = type_str_map.get(type_str)
-
-    def _get_value(self, name):
+    def visit_Assign(self, node: ast.Assign):
         """
-        Retrieves a value from the symbol table. If the symbol is a pointer
-        to a scalar value (e.g. an alloca), it loads the value.
-        Raw array data pointers (ending in .data) are returned as-is.
+        Processes an assignment statement like `df['c'] = df['a'] + df['b']`.
         """
-        if name is None: return None
-        val = self.symbol_table.get(name)
-        if val is None: raise NameError(f"Variable '{name}' not found.")
+        # We only care about single-target assignments
+        if len(node.targets) != 1:
+            return
+
+        target = node.targets[0]
+
+        # Check if the assignment is to a column of our target frame,
+        # e.g., `df['c']` where `target.value.id` is `df`.
+        if (isinstance(target, ast.Subscript) and
+            isinstance(target.value, ast.Name) and
+            target.value.id == self.frame_name):
+
+            # In a real compiler, we would need to evaluate the Python code
+            # for the right-hand side `node.value` to get the actual
+            # expression tree object. This is a complex process involving
+            # inspecting the function's frame and locals.
+            # Here, we will simulate it by retrieving the pre-built tree
+            # from the frame object itself.
+
+            output_col_name = target.slice.value
+            expr_tree = self.frame_obj._data.get(output_col_name)
+
+            if not isinstance(expr_tree, ExprNode):
+                # This assignment was not a lazy expression, so we can't JIT it.
+                return
+
+            # We found a JIT-able expression. Now, generate MLIR for it.
+            self._generate_fused_kernel(output_col_name, expr_tree)
+
+    def _generate_fused_kernel(self, output_col_name: str, expr_tree: ExprNode):
+        """
+        Generates the MLIR for a single `cobra.fused_kernel` operation.
+        """
+        # Discover all unique input columns by finding all ColumnNodes in the tree.
+        input_nodes = set(n for n in ast.walk(expr_tree) if isinstance(n, ColumnNode))
+        input_names = sorted([n.name for n in input_nodes]) # Sort for deterministic order
+
+        # Create the mapping from column names to generic kernel arg names.
+        input_map = {name: f"in{i}" for i, name in enumerate(input_names)}
+
+        # Traverse the tree to get the final kernel body string.
+        kernel_body = _traverse_expr_tree(expr_tree, input_map)
         
-        # If the symbol is a pointer AND not a special raw data pointer, load it.
-        if isinstance(val.type, ir.PointerType) and not name.endswith('.data'):
-            return self.builder.load(val, name=f"{name}.val")
-            
-        return val
+        # In our kernel, the output is always `out0`.
+        final_kernel_str = f"out0 = {kernel_body}"
 
-    def generate(self):
-        for opcode, arg in self.cobra_ir:
-            if opcode == 'LABEL': self.llvm_labels[arg] = self.function.append_basic_block(name=arg)
-
-        arg_idx = 0
-        for name, type_info in zip(self.arg_names, self.arg_types_info):
-            if type_info == 'CobraArray':
-                self.symbol_table[f"{name}.data"] = self.function.args[arg_idx]
-                self.symbol_table[f"{name}.size"] = self.function.args[arg_idx+1]
-                arg_idx += 2
-            else:
-                 # Check if the arg needs to be mutable (has a STORE operation)
-                is_mutable = any(opcode == 'STORE' and arg[0] == name for opcode, arg in self.cobra_ir)
-                if is_mutable:
-                    # Allocate space for mutable args and store the initial value
-                    alloc = self.builder.alloca(self.type_map[name], name=name)
-                    self.builder.store(self.function.args[arg_idx], alloc)
-                    self.symbol_table[name] = alloc
-                else:
-                    self.symbol_table[name] = self.function.args[arg_idx]
-                arg_idx += 1
+        # Get the MLIR types for the function signature (e.g., tensor<*xf32>)
+        # This would come from inspecting the actual CobraArray dtypes.
+        mlir_types = ["tensor<*xf32>"] * (len(input_names) + 1) # +1 for the output
         
-        self.builder.position_at_end(self.entry_block)
+        # Build the MLIR region's argument list (e.g., %in0: tensor<*xf32>, ...)
+        arg_defs = ", ".join([f"%in{i}: {t}" for i, t in enumerate(mlir_types[:-1])])
+        arg_defs += f", %out0: {mlir_types[-1]}"
         
-        for opcode, arg in self.cobra_ir:
-            if opcode == 'LABEL':
-                if not self.builder.block.is_terminated: self.builder.branch(self.llvm_labels[arg])
-                self.builder.position_at_end(self.llvm_labels[arg])
-            elif opcode == 'LOAD_CONST':
-                target, value = arg
-                self.symbol_table[target] = ir.Constant(self.type_map[target], value)
-            elif opcode == 'STORE':
-                target, source = arg
-                if target not in self.symbol_table:
-                     self.symbol_table[target] = self.builder.alloca(self.type_map.get(target, ir.IntType(64)), name=target)
-                self.builder.store(self._get_value(source), self.symbol_table[target])
-            elif opcode == 'LOAD_ATTR':
-                target, source_obj, attr = arg
-                if attr == 'size': self.symbol_table[target] = self.symbol_table[f"{source_obj}.size"]
-                else: raise NotImplementedError(f"Attribute '{attr}' not supported.")
-            elif opcode == 'LOAD_ELEMENT':
-                target, array_name, index_var = arg
-                array_ptr = self.symbol_table[f"{array_name}.data"]
-                index_val = self._get_value(index_var)
-                element_ptr = self.builder.gep(array_ptr, [index_val], name=f"{array_name}.gep")
-                self.symbol_table[target] = self.builder.load(element_ptr, name=target)
-            elif opcode == 'STORE_ELEMENT':
-                array_name, index_var, value_var = arg
-                array_ptr = self.symbol_table[f"{array_name}.data"]
-                index_val = self._get_value(index_var)
-                value_to_store = self._get_value(value_var)
-                element_ptr = self.builder.gep(array_ptr, [index_val], name=f"{array_name}.gep")
-                self.builder.store(value_to_store, element_ptr)
-            elif opcode in ('ADD', 'SUB', 'MUL'):
-                target, left_src, right_src = arg
-                left_val, right_val = self._get_value(left_src), self._get_value(right_src)
-                op_type = self.type_map[target]
-                op_map = {'ADD': self.builder.fadd if isinstance(op_type, ir.DoubleType) else self.builder.add,
-                          'SUB': self.builder.fsub if isinstance(op_type, ir.DoubleType) else self.builder.sub,
-                          'MUL': self.builder.fmul if isinstance(op_type, ir.DoubleType) else self.builder.mul}
-                self.symbol_table[target] = op_map[opcode](left_val, right_val, name=target)
-            elif opcode == 'COMPARE':
-                op, target, left_src, right_src = arg
-                left_val, right_val = self._get_value(left_src), self._get_value(right_src)
-                op_map = {'GT': '>', 'LT': '<'}
-                if isinstance(left_val.type, ir.DoubleType):
-                    self.symbol_table[target] = self.builder.fcmp_ordered(op_map[op], left_val, right_val, name=target)
-                else:
-                    self.symbol_table[target] = self.builder.icmp_signed(op_map[op], left_val, right_val, name=target)
-            elif opcode == 'CALL':
-                target, func_name, arg_sources = arg
-                target_func = self.module.get_global(f"cobra_{func_name}")
-                if target_func is None:
-                    raise NameError(f"JIT function '{func_name}' not found in current module.")
-                call_args = [self._get_value(s) for s in arg_sources]
-                self.symbol_table[target] = self.builder.call(target_func, call_args, name=target)
-            elif opcode == 'JUMP_IF_TRUE':
-                cond_var, then_label, else_label = arg
-                self.builder.cbranch(self._get_value(cond_var), self.llvm_labels[then_label], self.llvm_labels[else_label])
-            elif opcode == 'JUMP':
-                if not self.builder.block.is_terminated: self.builder.branch(self.llvm_labels[arg])
-            elif opcode == 'RETURN':
-                if not self.builder.block.is_terminated:
-                    return_val = self._get_value(arg)
-                    if return_val: self.builder.ret(return_val)
-                    else: self.builder.ret_void()
+        # Build the argument list for the operation itself
+        input_args = ", ".join([f"%{name}" for name in input_names])
+        output_arg = f"%{output_col_name}"
 
-        if not self.function.blocks[-1].is_terminated:
-            self.builder.position_at_end(self.function.blocks[-1])
-            if isinstance(self.return_type, ir.VoidType): self.builder.ret_void()
-            else: self.builder.unreachable()
+        mlir_op = f"""
+    %result = cobra.fused_kernel(%{input_args} -> %{output_arg}) {{
+    ^bb0({arg_defs}):
+      // Fused kernel body generated from Python expression:
+      // out0 = {kernel_body.replace('"', '""')}
+      cobra.yield
+    }} : ({", ".join(mlir_types[:-1])}) -> ({mlir_types[-1]})
+"""
+        self.mlir_ops.append(mlir_op)
 
-        return self.function
-
-def _compile_function(py_func, arg_types_info, module):
-    """Helper to compile a single Python function into a shared LLVM module."""
-    func_name = py_func.__name__
-
-    # Check if this specific specialization is already in the module
-    if any(f.name == f"cobra_{func_name}" for f in module.functions):
-        return module.get_global(f"cobra_{func_name}")
-
-    source_code = inspect.getsource(py_func)
-    tree = ast.parse(source_code)
-    arg_names = inspect.getfullargspec(py_func).args
-
-    ir_generator = CobraIrGenerator()
-    ir_generator.visit(tree)
-    cobra_ir = ir_generator.ir
-    
-    llvm_ir_generator = CobraLlvmIrGenerator(cobra_ir, arg_names, arg_types_info, func_name, module)
-    return llvm_ir_generator.generate()
+# ============================================================================
+# Step 3: The JIT Decorator
+# ============================================================================
 
 def jit(func):
     """
-    A decorator that performs type-specialized JIT compilation via LLVM.
+    A decorator that JIT-compiles functions containing CobraFrame operations.
     """
-    _JIT_REGISTRY[func.__name__] = func
-    func._jit_cache = {}
-
-    @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        arg_types_info = tuple('CobraArray' if isinstance(arg, CobraArray) else 
-                               'float' if isinstance(arg, float) else 
-                               'int' for arg in args)
+        # 1. Get the function's source code and parse it into an AST.
+        try:
+            source = inspect.getsource(func)
+            tree = ast.parse(source)
+        except (TypeError, OSError):
+            print("Cobra JIT Error: Could not get source code for function.")
+            return func(*args, **kwargs) # Fallback to pure Python
 
-        if arg_types_info in func._jit_cache:
-            cfunc, engine = func._jit_cache[arg_types_info]
+        # 2. Find the CobraFrame object among the function's arguments.
+        frame_obj = None
+        frame_name = None
+        func_sig = inspect.signature(func)
+        for i, param in enumerate(func_sig.parameters.values()):
+            if i < len(args) and hasattr(args[i], '_data'): # A simple check for CobraFrame
+                frame_obj = args[i]
+                frame_name = param.name
+                break
+        
+        if not frame_obj:
+            print("Cobra JIT Warning: No CobraFrame argument found. Running in Python mode.")
+            return func(*args, **kwargs)
+
+        # 3. First, execute the original function in Python. This has the
+        #    side-effect of building the expression trees inside the CobraFrame.
+        result = func(*args, **kwargs)
+
+        # 4. Now, analyze the function's AST to find assignments and generate MLIR.
+        visitor = JitAstVisitor(frame_name, frame_obj)
+        visitor.visit(tree)
+
+        # 5. If any compilable operations were found, send them to the backend.
+        if visitor.mlir_ops:
+            print("="*20 + " Cobra JIT Compilation " + "="*20)
+            print(f"Found {len(visitor.mlir_ops)} JIT-able operation(s) in '{func.__name__}'.")
+            
+            full_mlir_module = "module {\n" + "\n".join(visitor.mlir_ops) + "\n}"
+            
+            print("\n--- Generated MLIR Module ---")
+            print(full_mlir_module)
+            print("="*64)
+            
+            # This is where we would send the MLIR string to the C++ backend.
+            # manager.compile_and_run(full_mlir_module, frame_obj)
+            print("\n[Cobra JIT]>>> Sending to C++ backend for compilation and execution (simulated).")
         else:
-            main_func_name = func.__name__
-            print(f"[COBRA JIT] Compiling new specialization for '{main_func_name}' with types {arg_types_info}...")
-            
-            # --- Unified Compilation Session ---
-            module = ir.Module(name=f"cobra_module_{main_func_name}")
-            
-            # 1. Discover dependency graph
-            dependencies = set()
-            to_process = [func]
-            processed = set()
-            while to_process:
-                current_func = to_process.pop(0)
-                if current_func in processed: continue
-                processed.add(current_func)
-                
-                source_code = inspect.getsource(current_func)
-                tree = ast.parse(source_code)
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                        callee_name = node.func.id
-                        if callee_name in _JIT_REGISTRY:
-                            callee_func = _JIT_REGISTRY[callee_name]
-                            dependencies.add(callee_func)
-                            to_process.append(callee_func)
-            
-            # 2. Compile dependencies into the shared module
-            for dep_func in dependencies:
-                # This is a simplification; assumes dependencies have same arg types
-                _compile_function(dep_func, arg_types_info, module)
+            print(f"Cobra JIT: No compilable operations found in '{func.__name__}'.")
 
-            # 3. Compile the main function into the shared module
-            main_llvm_func = _compile_function(func, arg_types_info, module)
-            
-            print("\n[COBRA JIT] Generated LLVM IR:")
-            print(str(module))
-
-            # 4. Compile the entire module
-            binding.initialize_native_target()
-            binding.initialize_native_asmprinter()
-            target_machine = binding.Target.from_default_triple().create_target_machine()
-            
-            llvm_module = binding.parse_assembly(str(module))
-            llvm_module.verify()
-            
-            engine = binding.create_mcjit_compiler(llvm_module, target_machine)
-            engine.finalize_object()
-            
-            func_ptr = engine.get_function_address(main_llvm_func.name)
-
-            cfunc_arg_types = []
-            for t_info in arg_types_info:
-                if t_info == 'CobraArray': cfunc_arg_types.extend([ctypes.c_void_p, ctypes.c_int64])
-                elif t_info == 'float': cfunc_arg_types.append(ctypes.c_double)
-                else: cfunc_arg_types.append(ctypes.c_int64)
-
-            cfunc_return_type = None
-            if isinstance(main_llvm_func.return_value.type, ir.IntType): cfunc_return_type = ctypes.c_int64
-            elif isinstance(main_llvm_func.return_value.type, ir.DoubleType): cfunc_return_type = ctypes.c_double
-
-            cfunc = ctypes.CFUNCTYPE(cfunc_return_type, *cfunc_arg_types)(func_ptr)
-            
-            func._jit_cache[arg_types_info] = (cfunc, engine)
-            print("[COBRA JIT] Compilation to native code complete.")
-
-        native_args = []
-        for arg in args:
-            if isinstance(arg, CobraArray): native_args.extend([arg._data_ptr, arg.size])
-            else: native_args.append(arg)
-
-        print(f"\n[COBRA JIT] Executing native code for function: '{func.__name__}' with types {arg_types_info}")
-        result = cfunc(*args)
-        print("[COBRA JIT] Successfully executed native code.")
         return result
-    
     return wrapper
-
