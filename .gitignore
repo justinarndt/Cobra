@@ -1,0 +1,23 @@
+# Build artifacts from CMake, MSVC, and setuptools
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+*.lib
+*.obj
+*.exp
+*.ilk
+*.pdb
+*.sln
+*.vcxproj*
+*.suo
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# IDE and OS specific files
+.vscode/
+.idea/
+.DS_Store
