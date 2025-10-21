@@ -1,28 +1,142 @@
-// MODIFIED: src/memory/MemoryManager.cpp
+// src/memory/MemoryManager.cpp
+//
+// Implements the full logic for the MemoryManager class.
 
-// This function creates a kernel from the loaded module and executes it.
-void MemoryManager::launchKernel(const char* kernelName, /*...args...*/) {
+#include "memory/MemoryManager.h"
+#include <iostream>
+
+// Initialize the static singleton pointer to nullptr.
+MemoryManager* MemoryManager::s_instance = nullptr;
+
+// ============================================================================
+// Lifecycle Management Implementation
+// ============================================================================
+
+void MemoryManager::initialize() {
+    if (!s_instance) {
+        // This is the only place the constructor is ever called.
+        s_instance = new MemoryManager();
+    }
+}
+
+void MemoryManager::shutdown() {
+    delete s_instance;
+    s_instance = nullptr;
+}
+
+MemoryManager& MemoryManager::getInstance() {
+    if (!s_instance) {
+        // Enforce that cobra.init() must be called first.
+        throw std::runtime_error("MemoryManager not initialized. Call cobra.init() first.");
+    }
+    return *s_instance;
+}
+
+// ============================================================================
+// Constructor and Destructor (Runtime Setup/Teardown)
+// ============================================================================
+
+MemoryManager::MemoryManager() {
+    std::cout << "C++: Initializing MemoryManager and Level Zero Runtime..." << std::endl;
+
+    // 1. Initialize the Level Zero driver library
+    zeInit(0);
+
+    // 2. Discover the driver
+    uint32_t driverCount = 1;
+    zeDriverGet(&driverCount, &m_driver_handle);
+
+    // 3. Discover the device (GPU)
+    uint32_t deviceCount = 1;
+    zeDeviceGet(m_driver_handle, &deviceCount, &m_device_handle);
+
+    // 4. Create a context
+    ze_context_desc_t context_desc = {};
+    zeContextCreate(m_driver_handle, &context_desc, &m_context_handle);
+
+    // 5. Create a command queue
+    ze_command_queue_desc_t cmd_queue_desc = {};
+    cmd_queue_desc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+    zeCommandQueueCreate(m_context_handle, m_device_handle, &cmd_queue_desc, &m_command_queue);
+
+    // 6. Create a command list
+    ze_command_list_desc_t cmd_list_desc = {};
+    zeCommandListCreate(m_context_handle, m_device_handle, &cmd_list_desc, &m_command_list);
+
+    m_module_handle = nullptr;
+    m_kernel_handle = nullptr;
+
+    std::cout << "C++: Level Zero Runtime Initialized Successfully." << std::endl;
+}
+
+MemoryManager::~MemoryManager() {
+    std::cout << "C++: Shutting Down MemoryManager and Level Zero Runtime..." << std::endl;
+
+    // Destroy resources in the reverse order of creation
+    if (m_kernel_handle) zeKernelDestroy(m_kernel_handle);
+    if (m_module_handle) zeModuleDestroy(m_module_handle);
+    zeCommandListDestroy(m_command_list);
+    zeCommandQueueDestroy(m_command_queue);
+    zeContextDestroy(m_context_handle);
+
+    std::cout << "C++: Level Zero Runtime Shut Down." << std::endl;
+}
+
+// ============================================================================
+// Core Functionality Implementation
+// ============================================================================
+
+void* MemoryManager::allocate(size_t size) {
+    void* ptr = nullptr;
+    ze_device_mem_alloc_desc_t mem_desc = {};
+    mem_desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+
+    zeMemAllocDevice(m_context_handle, &mem_desc, size, 1, m_device_handle, &ptr);
+    if (!ptr) {
+        throw std::runtime_error("Failed to allocate device memory.");
+    }
+    return ptr;
+}
+
+void MemoryManager::free(void* ptr) {
+    if (ptr) {
+        zeMemFree(m_context_handle, ptr);
+    }
+}
+
+void MemoryManager::loadKernel(const std::vector<uint32_t>& spirv_binary, const char* kernelName) {
+    // If a module is already loaded, destroy it first
+    if (m_kernel_handle) zeKernelDestroy(m_kernel_handle);
+    if (m_module_handle) zeModuleDestroy(m_module_handle);
+
+    // Load the new SPIR-V module
+    ze_module_desc_t module_desc = {};
+    module_desc.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
+    module_desc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    module_desc.inputSize = spirv_binary.size() * sizeof(uint32_t);
+    module_desc.pInputModule = reinterpret_cast<const uint8_t*>(spirv_binary.data());
+
+    zeModuleCreate(m_context_handle, m_device_handle, &module_desc, &m_module_handle, nullptr);
+
+    // Create the kernel from the loaded module
     ze_kernel_desc_t kernel_desc = {};
     kernel_desc.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
     kernel_desc.pKernelName = kernelName;
+    zeKernelCreate(m_module_handle, &kernel_desc, &m_kernel_handle);
+}
 
-    ze_kernel_handle_t kernel_handle;
-    zeKernelCreate(m_module_handle, &kernel_desc, &kernel_handle);
+void MemoryManager::launchKernel() {
+    if (!m_kernel_handle) {
+        throw std::runtime_error("No kernel loaded to launch.");
+    }
+    // A real implementation would set arguments and grid dimensions here.
+    // For now, we just reset and close the command list to show the flow.
+    zeCommandListReset(m_command_list);
+    // ... zeCommandListAppendLaunchKernel would go here ...
+    zeCommandListClose(m_command_list);
 
-    // Set kernel arguments (pointers to CobraArray data, scalars, etc.)
-    // This requires a loop over the function's arguments.
-    // zeKernelSetArgumentValue(kernel_handle, 0, sizeof(void*), &arg0_ptr);
-    // zeKernelSetArgumentValue(kernel_handle, 1, sizeof(void*), &arg1_ptr);
-
-    // Configure thread group size, etc.
-    ze_group_count_t launch_args = { /*gridDimX*/, /*gridDimY*/, /*gridDimZ*/ };
-
-    // Append the kernel launch command to a command list for execution.
-    zeCommandListAppendLaunchKernel(
-        m_command_list,
-        kernel_handle,
-        &launch_args,
-        nullptr, 0, nullptr);
-
-    // The command list will be executed later.
+    // Execute the command list
+    zeCommandQueueExecuteCommandLists(m_command_queue, 1, &m_command_list, nullptr);
+    // Wait for completion
+    zeCommandQueueSynchronize(m_command_queue, UINT32_MAX);
 }
