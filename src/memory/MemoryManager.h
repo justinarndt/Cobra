@@ -3,6 +3,7 @@
 // Defines the interface for the core C++ MemoryManager singleton.
 // This class is responsible for the entire lifecycle of the SYCL/Level Zero
 // runtime, including device initialization, memory allocation, and kernel execution.
+// It also handles host CPU feature detection.
 
 #ifndef MEMORY_MANAGER_H
 #define MEMORY_MANAGER_H
@@ -45,6 +46,16 @@ public:
     // (A real implementation would take more arguments for kernel args, grid size etc.)
     void launchKernel();
 
+    // ========================================================================
+    // CPU Feature Accessors
+    // ========================================================================
+
+    // Returns true if the host CPU supports AVX-512F instructions.
+    bool hasAVX512() const { return m_has_avx512; }
+
+    // Returns true if the host CPU supports AMX (BF16) instructions.
+    bool hasAMX() const { return m_has_amx; }
+
 
 private:
     // The private static pointer that holds the single instance.
@@ -61,11 +72,14 @@ private:
     MemoryManager(const MemoryManager&) = delete;
     MemoryManager& operator=(const MemoryManager&) = delete;
 
-    // ========================================================================
-    // Private Member Variables (Level Zero Handles)
-    // ========================================================================
-    // These handles represent the state of our connection to the hardware.
+    // Helper method to query CPU features using the CPUID instruction.
+    void detectCPUFeatures();
 
+    // ========================================================================
+    // Private Member Variables (Level Zero & CPU)
+    // ========================================================================
+
+    // Level Zero handles for GPU interaction
     ze_driver_handle_t m_driver_handle;
     ze_device_handle_t m_device_handle;
     ze_context_handle_t m_context_handle;
@@ -73,6 +87,10 @@ private:
     ze_command_list_handle_t m_command_list;
     ze_module_handle_t m_module_handle;
     ze_kernel_handle_t m_kernel_handle;
+
+    // Flags for detected CPU features
+    bool m_has_avx512;
+    bool m_has_amx;
 };
 
 #endif // MEMORY_MANAGER_H
